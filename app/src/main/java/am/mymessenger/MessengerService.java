@@ -6,13 +6,33 @@ import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
+import android.webkit.WebView;
 
 /** Keeps the app process (and the messenger page inside it) alive while the app is closed. */
 public class MessengerService extends Service {
 
     private PowerManager.WakeLock wakeLock;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+
+    /** Every 15 s pokes the page so its link to the server stays alive while the page is throttled in the background. */
+    private final Runnable keepAlive = new Runnable() {
+        @Override
+        public void run() {
+            WebView w = Hub.webView;
+            if (w != null) {
+                try {
+                    w.evaluateJavascript("window.__keepAlive&&window.__keepAlive()", null);
+                } catch (Exception ignored) {
+                    // the page is not ready yet
+                }
+            }
+            handler.postDelayed(this, 15000);
+        }
+    };
 
     @Override
     public void onCreate() {
@@ -39,6 +59,8 @@ public class MessengerService extends Service {
         }
 
         Hub.ensure(this);
+        handler.removeCallbacks(keepAlive);
+        handler.postDelayed(keepAlive, 15000);
 
         try {
             PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
@@ -64,6 +86,7 @@ public class MessengerService extends Service {
 
     @Override
     public void onDestroy() {
+        handler.removeCallbacks(keepAlive);
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
         }

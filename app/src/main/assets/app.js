@@ -276,11 +276,7 @@
         img.addEventListener('click', function (e) { e.stopPropagation(); if (img.src) openViewer(img.src); });
         d.appendChild(img);
       } else if (m.k === 'aud') {
-        var a = el('audio');
-        a.controls = true; a.preload = 'metadata';
-        setMedia(m.i, function (u) { a.src = u; });
-        d.appendChild(a);
-        if (m.dur) d.appendChild(el('span', 'dur', '🎤 ' + fmtDur(m.dur)));
+        d.appendChild(voiceEl(m));
       } else {
         d.appendChild(document.createTextNode(m.x));
       }
@@ -328,6 +324,7 @@
     });
     if (q && !shown) log.appendChild(el('div', 'date-sep', 'Ոչինչ չգտնվեց'));
     log.scrollTop = near ? log.scrollHeight : prevTop;
+    vpPaint();
     renderChatHeader();
     sendRead(current);
   }
@@ -345,7 +342,7 @@
     c.unread = 0; saveContacts();
     native('clearNotification', id);
     searchQ = ''; $('#in-search').value = ''; $('#searchbar').hidden = true;
-    $('#emoji').hidden = true;
+    setEmoji(false);
     setReply(null);
     $('#in-msg').value = ''; autoGrow(); updateComposerMode();
     showScreen('chat');
@@ -355,8 +352,9 @@
   }
   function closeChat() {
     if (rec) cancelRec();
+    stopAud();
     current = null;
-    $('#emoji').hidden = true;
+    setEmoji(false);
     renderHome();
     showScreen('home');
   }
@@ -450,17 +448,92 @@
       try { db.transaction('media', 'readwrite').objectStore('media').delete(k); } catch (e) {}
     });
   }
-  function setMedia(i, cb) {
+  function setMedia(i, cb, miss) {
     if (urlCache[i]) { cb(urlCache[i]); return; }
     idbGet(i, function (blob) {
-      if (!blob) return;
+      if (!blob) { if (miss) miss(); return; }
       if (!urlCache[i]) urlCache[i] = URL.createObjectURL(blob);
       cb(urlCache[i]);
     });
   }
   function dropMedia(i) {
+    if (curAud && curAud.i === i) stopAud();
     if (urlCache[i]) { try { URL.revokeObjectURL(urlCache[i]); } catch (e) {} delete urlCache[i]; }
     idbDel(i);
+  }
+
+  /* ---------- voice note player (WhatsApp style: tap play, no menus) ---------- */
+  var curAud = null, vpRate = 1;
+  function voiceEl(m) {
+    var vp = el('div', 'vp');
+    vp.setAttribute('data-i', m.i);
+    var btn = el('button', 'vp-btn', '▶');
+    btn.type = 'button';
+    btn.setAttribute('aria-label', 'Նվագարկել');
+    btn.addEventListener('click', function (e) { e.stopPropagation(); vpToggle(m); });
+    var mid = el('div', 'vp-mid');
+    var bar = el('div', 'vp-bar');
+    bar.appendChild(el('div', 'vp-fill'));
+    mid.appendChild(bar);
+    mid.appendChild(el('span', 'vp-t', fmtDur(m.dur || 0)));
+    var spd = el('button', 'vp-spd', vpRate + '×');
+    spd.type = 'button';
+    spd.setAttribute('aria-label', 'Արագություն');
+    spd.addEventListener('click', function (e) {
+      e.stopPropagation();
+      vpRate = vpRate === 1 ? 1.5 : vpRate === 1.5 ? 2 : 1;
+      if (curAud) curAud.a.playbackRate = vpRate;
+      vpPaint();
+    });
+    vp.appendChild(btn); vp.appendChild(mid); vp.appendChild(spd);
+    return vp;
+  }
+  function vpPaint() {
+    var all = document.querySelectorAll('#log .vp');
+    for (var k = 0; k < all.length; k++) {
+      var n = all[k], i = n.getAttribute('data-i');
+      var on = curAud && curAud.i === i;
+      var playing = on && !curAud.a.paused;
+      var cur = on ? curAud.a.currentTime : 0, dur = on ? curAud.dur : 0;
+      n.querySelector('.vp-btn').textContent = playing ? '⏸' : '▶';
+      n.querySelector('.vp-btn').setAttribute('aria-label', playing ? 'Դադար' : 'Նվագարկել');
+      n.querySelector('.vp-fill').style.width = (on && dur ? Math.min(100, cur / dur * 100) : 0) + '%';
+      var m = findMsg(current, i), total = m && m.dur ? m.dur : 0;
+      n.querySelector('.vp-t').textContent = fmtDur(on && playing ? cur : total);
+      n.querySelector('.vp-spd').textContent = vpRate + '×';
+    }
+  }
+  function stopAud() {
+    if (curAud) {
+      try { curAud.a.pause(); curAud.a.removeAttribute('src'); curAud.a.load(); } catch (e) {}
+      curAud = null;
+    }
+    vpPaint();
+  }
+  function vpToggle(m) {
+    if (curAud && curAud.i === m.i) {
+      if (curAud.a.paused) { var pr = curAud.a.play(); if (pr && pr.catch) pr.catch(function () {}); }
+      else curAud.a.pause();
+      vpPaint();
+      return;
+    }
+    stopAud();
+    setMedia(m.i, function (u) {
+      var a = new Audio();
+      a.preload = 'auto';
+      a.src = u;
+      a.playbackRate = vpRate;
+      var me2 = { i: m.i, a: a, dur: m.dur || 0 };
+      curAud = me2;
+      a.addEventListener('timeupdate', vpPaint);
+      a.addEventListener('play', vpPaint);
+      a.addEventListener('pause', vpPaint);
+      a.addEventListener('ended', function () { if (curAud === me2) stopAud(); });
+      a.addEventListener('error', function () { if (curAud === me2) { toast('Ձայնը չհաջողվեց նվագարկել'); stopAud(); } });
+      var p = a.play();
+      if (p && p.catch) p.catch(function (e) { if (curAud === me2) { toast('Նվագարկման սխալ՝ ' + ((e && e.name) || '')); stopAud(); } });
+      vpPaint();
+    }, function () { toast('Ձայնային ֆայլը չի գտնվել'); });
   }
 
   /* ---------- networking (PeerJS) ---------- */
@@ -481,6 +554,7 @@
     p.on('disconnected', function () {
       if (p !== peer) return;
       setStatus(false, 'Կապ չկա');
+      setTimeout(function () { if (p === peer && !p.destroyed && p.disconnected) { try { p.reconnect(); } catch (e) {} } }, 1500);
     });
     p.on('close', function () {
       if (p !== peer) return;
@@ -495,7 +569,7 @@
         try { p.destroy(); } catch (e) {}
         peer = null;
         idRetry++;
-        if (idRetry <= 4) { setStatus(false, 'Միանում է…'); setTimeout(startPeer, 3000); }
+        if (idRetry <= 20) { setStatus(false, 'Միանում է…'); setTimeout(startPeer, 4000); }
         else { idRetry = 0; openSetup('Այս ID-ն արդեն զբաղված է։ Ընտրիր ուրիշ ID։'); }
       } else if (type === 'peer-unavailable') {
         // Failed message retries to other offline contacts also raise this error, so match the callee.
@@ -546,6 +620,11 @@
   setInterval(tick, 8000);
   document.addEventListener('visibilitychange', function () { if (!document.hidden) tick(); });
   window.addEventListener('online', tick);
+  // Called from the native service every ~15 s so the link stays alive even when the page is throttled in the background.
+  window.__keepAlive = function () {
+    try { if (peer && peer.socket && peer.socket.send && !peer.disconnected) peer.socket.send({ type: 'HEARTBEAT' }); } catch (e) {}
+    tick();
+  };
 
   // conns[id] is a list: a contact can have several links at once (one we opened, one they opened).
   var CONNECT_PATIENCE = 40000; // how long a link may stay "connecting" before we try a fresh one
@@ -1270,7 +1349,17 @@
       box.appendChild(b);
     });
   })();
-  $('#btn-emoji').addEventListener('click', function () { $('#emoji').hidden = !$('#emoji').hidden; });
+  function setEmoji(on) {
+    $('#emoji').hidden = !on;
+    $('#btn-emoji').textContent = on ? '⌨️' : '😊';
+    $('#btn-emoji').setAttribute('aria-label', on ? 'Ստեղնաշար' : 'Էմոջի');
+  }
+  $('#btn-emoji').addEventListener('click', function () {
+    if ($('#emoji').hidden) { $('#in-msg').blur(); setEmoji(true); }
+    else { setEmoji(false); $('#in-msg').focus(); }
+  });
+  $('#in-msg').addEventListener('focus', function () { setEmoji(false); });
+  $('#log').addEventListener('click', function () { if (!$('#emoji').hidden) setEmoji(false); });
 
   /* ---------- photos ---------- */
   function compressImage(file, cb) {
@@ -1330,7 +1419,7 @@
   function showRecUI(on) {
     $('#composer').hidden = on;
     $('#rec').hidden = !on;
-    if (on) $('#emoji').hidden = true;
+    if (on) setEmoji(false);
   }
   function startRec() {
     if (!current || rec) return;
@@ -1400,7 +1489,7 @@
     var open = document.querySelector('dialog[open]');
     if (open) { try { open.close(); } catch (e) { open.removeAttribute('open'); } return true; }
     if (rec) { cancelRec(); return true; }
-    if (!$('#emoji').hidden) { $('#emoji').hidden = true; return true; }
+    if (!$('#emoji').hidden) { setEmoji(false); return true; }
     if (!$('#searchbar').hidden) { closeSearch(); return true; }
     if (!$('#chat').hidden) { closeChat(); return true; }
     return false;
