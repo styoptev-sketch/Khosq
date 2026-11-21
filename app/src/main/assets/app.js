@@ -181,7 +181,7 @@
     paintAvatar(a, c);
     return a;
   }
-  function renderHome() {
+  function renderHomeList() {
     var list = $('#chats');
     list.textContent = '';
     var ids = Object.keys(contacts).sort(function (a, b) { return lastTs(b) - lastTs(a); });
@@ -346,6 +346,7 @@
     setReply(null);
     $('#in-msg').value = ''; autoGrow(); updateComposerMode();
     showScreen('chat');
+    autoGrow();
     renderChat(true);
     connectTo(id);
     flush(id);
@@ -374,7 +375,8 @@
   function autoGrow() {
     var ta = $('#in-msg');
     ta.style.height = 'auto';
-    ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
+    var h = ta.scrollHeight;
+    ta.style.height = h ? Math.min(h, 120) + 'px' : '';
   }
   function updateComposerMode() {
     var has = $('#in-msg').value.trim().length > 0;
@@ -616,6 +618,7 @@
     if (peer.disconnected) { try { peer.reconnect(); } catch (e) {} return; }
     if (online) Object.keys(msgs).forEach(flush);
     if (current) { sendRead(current); renderChatHeader(); }
+    purgeStories();
   }
   setInterval(tick, 8000);
   document.addEventListener('visibilitychange', function () { if (!document.hidden) tick(); });
@@ -676,6 +679,7 @@
   }
   function flush(id) {
     if (!online) return;
+    flushStories(id);
     var list = pending(id);
     var dels = (msgs[id] || []).filter(function (m) { return m.m && m.d && m.dp; });
     if (!list.length && !dels.length) return;
@@ -744,10 +748,11 @@
   }
   function onMediaHeader(id, d) {
     if (typeof d.i !== 'string' || d.i.length > 40) return;
-    if (d.k !== 'img' && d.k !== 'aud') return;
+    if (d.k !== 'img' && d.k !== 'aud' && d.k !== 'story') return;
     var n = d.n | 0;
     if (n < 1 || n > MAX_CHUNKS) return;
-    if (findMsg(id, d.i)) { sendCtl(id, { t: 'ack', i: d.i }); return; }
+    if (d.k === 'story') { if (hasStory(d.i)) { sendCtl(id, { t: 'sack', i: d.i }); return; } }
+    else if (findMsg(id, d.i)) { sendCtl(id, { t: 'ack', i: d.i }); return; }
     var key = id + ':' + d.i;
     if (incomingMedia[key]) return;
     incomingMedia[key] = { h: d, parts: new Array(n), got: 0 };
@@ -771,8 +776,12 @@
       for (var k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
     } catch (e) { return; }
     var base = String(h.mime || '').split(';')[0];
-    var mime = h.k === 'img' ? 'image/jpeg' : (AUD_OK.indexOf(base) !== -1 ? String(h.mime) : 'audio/webm');
+    var mime = (h.k === 'img' || h.k === 'story') ? 'image/jpeg' : (AUD_OK.indexOf(base) !== -1 ? String(h.mime) : 'audio/webm');
     var blob = new Blob([bytes], { type: mime });
+    if (h.k === 'story') {
+      idbPut('s:' + h.i, blob, function () { addStory(id, { i: h.i, k: 'img', x: h.x, ttl: h.ttl }); });
+      return;
+    }
     idbPut(h.i, blob, function () {
       if (findMsg(id, h.i)) { sendCtl(id, { t: 'ack', i: h.i }); return; }
       var m = { i: h.i, m: false, k: h.k, x: '', ts: Date.now() };
@@ -861,6 +870,8 @@
     } else if (d.t === 'delack') {
       var am = typeof d.i === 'string' ? findMsg(id, d.i) : null;
       if (am && am.dp) { delete am.dp; saveMsgs(); }
+    } else if (d.t === 'story' || d.t === 'sack' || d.t === 'sview') {
+      onStoryData(id, d);
     } else if (d.t === 'bye') {
       if (incoming && incoming.peer === id) { dismissIncoming(); toast('Բաց թողնված զանգ'); missedCall(id); native('callEnded'); }
       if (call && callId === id) endCall(false);
@@ -1239,6 +1250,7 @@
     if (!delArmed) { delArmed = true; $('#contact-del').textContent = 'Այո, ջնջել'; $('#contact-hint').hidden = false; return; }
     var id = contactId;
     (msgs[id] || []).forEach(function (m) { if (m.k) dropMedia(m.i); });
+    removeStoriesOf(id);
     delete contacts[id]; delete msgs[id];
     saveContacts(); saveMsgs();
     closeDialog('#dlg-contact');
@@ -1481,6 +1493,349 @@
   $('#in-search').addEventListener('input', function () { searchQ = this.value.trim(); renderChat(true); });
   $('#search-x').addEventListener('click', closeSearch);
 
+  /* ---------- stories: 24-hour posts for contacts, sent while they are online ---------- */
+  var STORY_TTL = 24 * 3600 * 1000;
+  var STORY_BG = [
+    'linear-gradient(160deg,#FFC84A,#FF6B57)', 'linear-gradient(160deg,#4F7BFF,#9B4BFF)',
+    'linear-gradient(160deg,#12C2A3,#2E5BFF)', 'linear-gradient(160deg,#FF5E8A,#FF9A3D)',
+    'linear-gradient(160deg,#1B2466,#5B2A86)', 'linear-gradient(160deg,#0F2027,#2C5364)'
+  ];
+  var stories = load('stories', []);   // { i, from ('me' or contact id), k:'img'|'txt', x, bg, ts, exp, seen, sentTo[], views[] }
+  var busyStory = {}, storyOpen = false, sv = null;
+
+  function saveStories() { save('stories', stories); }
+  function hasStory(i) {
+    for (var k = 0; k < stories.length; k++) { if (stories[k].i === i) return true; }
+    return false;
+  }
+  function purgeStories() {
+    var now = Date.now(), keep = [], dropped = false;
+    stories.forEach(function (s) {
+      if (s.exp > now && (s.from === 'me' || contacts[s.from])) keep.push(s);
+      else { dropped = true; if (s.k === 'img') dropMedia('s:' + s.i); }
+    });
+    if (dropped) { stories = keep; saveStories(); if (!current && !storyOpen) renderStories(); }
+  }
+  function removeStoriesOf(id) {
+    stories = stories.filter(function (s) {
+      if (s.from !== id) return true;
+      if (s.k === 'img') dropMedia('s:' + s.i);
+      return false;
+    });
+    saveStories();
+  }
+
+  /* receiving */
+  function addStory(from, o) {
+    if (!contacts[from] || typeof o.i !== 'string' || o.i.length > 40 || hasStory(o.i)) {
+      if (contacts[from] && typeof o.i === 'string') sendCtl(from, { t: 'sack', i: o.i });
+      return;
+    }
+    var ttl = Math.max(60000, Math.min(STORY_TTL, Number(o.ttl) || STORY_TTL));
+    var s = {
+      i: o.i, from: from, k: o.k === 'img' ? 'img' : 'txt',
+      x: clip(String(o.x || ''), 280), bg: clampInt(o.bg, 0, STORY_BG.length - 1),
+      ts: Date.now(), exp: Date.now() + ttl, seen: false
+    };
+    stories.push(s);
+    saveStories();
+    sendCtl(from, { t: 'sack', i: s.i });
+    if (!current && !storyOpen) renderStories();
+  }
+  function onStoryData(id, d) {
+    if (!contacts[id]) return;
+    if (d.t === 'story') {
+      if (typeof d.i !== 'string' || typeof d.x !== 'string') return;
+      addStory(id, { i: d.i, k: 'txt', x: d.x, bg: d.bg, ttl: d.ttl });
+    } else if (d.t === 'sack') {
+      stories.forEach(function (s) {
+        if (s.from === 'me' && s.i === d.i) { s.sentTo = s.sentTo || []; if (s.sentTo.indexOf(id) === -1) { s.sentTo.push(id); saveStories(); } }
+      });
+    } else if (d.t === 'sview') {
+      stories.forEach(function (s) {
+        if (s.from === 'me' && s.i === d.i) {
+          s.views = s.views || [];
+          if (s.views.indexOf(id) === -1) { s.views.push(id); saveStories(); if (storyOpen && sv && sv.from === 'me') paintStoryFoot(); }
+        }
+      });
+    }
+  }
+
+  /* sending: every contact that is online and has not confirmed yet */
+  function flushStories(id) {
+    var c = openConn(id);
+    if (!c) return;
+    var now = Date.now();
+    stories.forEach(function (s) {
+      if (s.from !== 'me' || s.exp <= now || (s.sentTo || []).indexOf(id) !== -1) return;
+      var key = id + ':' + s.i;
+      if (busyStory[key]) return;
+      if (s.k === 'txt') {
+        try { c.send({ t: 'story', i: s.i, x: s.x, bg: s.bg, ttl: s.exp - now }); } catch (e) {}
+        return;
+      }
+      busyStory[key] = true;
+      idbGet('s:' + s.i, function (blob) {
+        if (!blob) { busyStory[key] = false; return; }
+        var fr = new FileReader();
+        fr.onerror = function () { busyStory[key] = false; };
+        fr.onload = function () {
+          var str = String(fr.result), b64 = str.slice(str.indexOf(',') + 1), n = Math.ceil(b64.length / CHUNK);
+          try {
+            c.send({ t: 'mh', i: s.i, k: 'story', mime: 'image/jpeg', n: n, x: s.x, ttl: s.exp - Date.now() });
+            for (var j = 0; j < n; j++) c.send({ t: 'mc', i: s.i, s: j, d: b64.slice(j * CHUNK, (j + 1) * CHUNK) });
+          } catch (e) {}
+          setTimeout(function () { busyStory[key] = false; }, 20000);
+        };
+        fr.readAsDataURL(blob);
+      });
+    });
+  }
+  function broadcastStories() { Object.keys(contacts).forEach(flushStories); }
+
+  /* the rail on the home screen */
+  function storyTile(label, who, state, onTap, plusTap) {
+    var b = el('button', 'story-tile');
+    b.type = 'button';
+    var ring = el('span', 'story-ring ' + state);
+    ring.appendChild(avatarEl(who));
+    if (plusTap) {
+      var p = el('span', 'plus', '+');
+      p.setAttribute('role', 'button');
+      p.setAttribute('aria-label', 'Նոր սթորի');
+      p.addEventListener('click', function (e) { e.stopPropagation(); plusTap(); });
+      ring.appendChild(p);
+    }
+    b.appendChild(ring);
+    b.appendChild(el('span', 'story-name', label));
+    b.addEventListener('click', onTap);
+    return b;
+  }
+  function renderStories() {
+    var box = $('#stories');
+    if (!box) return;
+    box.textContent = '';
+    var now = Date.now();
+    var mine = stories.filter(function (s) { return s.from === 'me' && s.exp > now; });
+    box.appendChild(storyTile('Իմ սթորին', me, mine.length ? 'new' : 'none',
+      function () { if (mine.length) openStory('me'); else openStoryComposer(); }, openStoryComposer));
+    var by = {};
+    stories.forEach(function (s) { if (s.from !== 'me' && s.exp > now && contacts[s.from]) (by[s.from] = by[s.from] || []).push(s); });
+    Object.keys(by).map(function (id) {
+      var l = by[id];
+      return { id: id, unseen: l.some(function (s) { return !s.seen; }), ts: Math.max.apply(null, l.map(function (s) { return s.ts; })) };
+    }).sort(function (a, b) { return (b.unseen - a.unseen) || (b.ts - a.ts); }).forEach(function (o) {
+      var c = contacts[o.id];
+      box.appendChild(storyTile(c.name || o.id, c, o.unseen ? 'new' : 'seen', function () { openStory(o.id); }));
+    });
+    $('#stories').classList.toggle('lonely', box.children.length === 1);
+  }
+  function renderHome() { renderHomeList(); renderStories(); }
+
+  /* the viewer */
+  function storyDur(s) { return s.k === 'txt' ? Math.min(9000, 4500 + s.x.length * 40) : 5500; }
+  function openStory(from) {
+    var now = Date.now();
+    var list = stories.filter(function (s) { return s.from === from && s.exp > now; }).sort(function (a, b) { return a.ts - b.ts; });
+    if (!list.length) return;
+    var idx = 0;
+    if (from !== 'me') { for (var k = 0; k < list.length; k++) { if (!list[k].seen) { idx = k; break; } } }
+    sv = { from: from, list: list, idx: idx, el: 0, last: 0, hold: false, raf: 0, typing: false };
+    storyOpen = true;
+    $('#story').hidden = false;
+    showStoryItem();
+  }
+  function closeStory() {
+    if (sv) cancelAnimationFrame(sv.raf);
+    sv = null; storyOpen = false;
+    $('#story').hidden = true;
+    $('#story-stage').textContent = '';
+    renderStories();
+  }
+  function curStory() { return sv && sv.list[sv.idx]; }
+  function showStoryItem() {
+    var s = curStory();
+    if (!s) { closeStory(); return; }
+    cancelAnimationFrame(sv.raf);
+    sv.el = 0; sv.last = performance.now();
+    var bars = $('#story-bars');
+    bars.textContent = '';
+    sv.list.forEach(function (x, k) {
+      var b = el('span', 'sbar'), f = el('span', 'sfill');
+      f.style.width = k < sv.idx ? '100%' : '0%';
+      b.appendChild(f); bars.appendChild(b);
+    });
+    var who = sv.from === 'me' ? me : contacts[sv.from];
+    var head = $('#story-who');
+    head.textContent = '';
+    head.appendChild(avatarEl(who));
+    var t = el('span', 'sw-t');
+    t.appendChild(el('b', null, sv.from === 'me' ? 'Իմ սթորին' : (who.name || who.id)));
+    t.appendChild(el('span', null, hhmm(s.ts)));
+    head.appendChild(t);
+    var st = $('#story-stage');
+    st.textContent = '';
+    st.style.background = STORY_BG[s.bg] || STORY_BG[0];
+    if (s.k === 'img') {
+      var im = el('img', 'story-pic');
+      im.alt = 'Սթորի';
+      setMedia('s:' + s.i, function (u) { im.src = u; }, function () { toast('Պատկերը չի գտնվել'); });
+      st.appendChild(im);
+      if (s.x) st.appendChild(el('div', 'story-cap', s.x));
+    } else {
+      st.appendChild(el('div', 'story-text', s.x));
+    }
+    if (sv.from !== 'me' && !s.seen) {
+      s.seen = true; saveStories();
+      sendCtl(sv.from, { t: 'sview', i: s.i });
+    }
+    paintStoryFoot();
+    sv.raf = requestAnimationFrame(storyTick);
+  }
+  function paintStoryFoot() {
+    var s = curStory(), foot = $('#story-foot');
+    if (!s) return;
+    var mineFoot = sv.from === 'me';
+    $('#story-reply').hidden = mineFoot;
+    $('#story-mine').hidden = !mineFoot;
+    if (mineFoot) {
+      var n = (s.views || []).length;
+      $('#story-views').textContent = '👁 ' + n + (n === 1 ? ' դիտում' : ' դիտում');
+    }
+    foot.hidden = false;
+  }
+  function storyTick(now) {
+    if (!sv) return;
+    var s = curStory();
+    if (!s) return;
+    var dt = now - sv.last; sv.last = now;
+    if (!sv.hold && !sv.typing) sv.el += dt;
+    var p = Math.min(1, sv.el / storyDur(s));
+    var fills = $('#story-bars').querySelectorAll('.sfill');
+    if (fills[sv.idx]) fills[sv.idx].style.width = (p * 100) + '%';
+    if (p >= 1) { storyNext(); return; }
+    sv.raf = requestAnimationFrame(storyTick);
+  }
+  function storyNext() {
+    if (!sv) return;
+    if (sv.idx < sv.list.length - 1) { sv.idx++; showStoryItem(); } else closeStory();
+  }
+  function storyPrev() {
+    if (!sv) return;
+    if (sv.idx > 0) sv.idx--;
+    showStoryItem();
+  }
+  (function () {
+    var st = $('#story-stage'), t0 = 0, holdTimer = null, held = false;
+    st.addEventListener('pointerdown', function () {
+      t0 = Date.now(); held = false;
+      holdTimer = setTimeout(function () { held = true; if (sv) sv.hold = true; }, 220);
+    });
+    function up(e) {
+      clearTimeout(holdTimer);
+      if (sv) sv.hold = false;
+      if (e.type === 'pointercancel' || held || !sv) return;
+      var r = st.getBoundingClientRect();
+      if (e.clientX - r.left < r.width * 0.32) storyPrev(); else storyNext();
+    }
+    st.addEventListener('pointerup', up);
+    st.addEventListener('pointercancel', up);
+  })();
+  $('#story-close').addEventListener('click', closeStory);
+  $('#story-del').addEventListener('click', function () {
+    var s = curStory();
+    if (!s || s.from !== 'me') return;
+    if (s.k === 'img') dropMedia('s:' + s.i);
+    stories = stories.filter(function (x) { return x !== s; });
+    saveStories();
+    sv.list.splice(sv.idx, 1);
+    if (!sv.list.length) closeStory();
+    else { if (sv.idx >= sv.list.length) sv.idx = sv.list.length - 1; showStoryItem(); }
+    toast('Սթորին ջնջվեց');
+  });
+  $('#story-in').addEventListener('focus', function () { if (sv) sv.typing = true; });
+  $('#story-in').addEventListener('blur', function () { if (sv) sv.typing = false; });
+  $('#story-reply').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var s = curStory(), inp = $('#story-in'), text = inp.value.trim();
+    if (!s || !text || sv.from === 'me') return;
+    var to = sv.from;
+    var m = { i: uid(), m: true, x: text.slice(0, 4000), ts: Date.now(), s: 'p', q: { i: s.i, x: '📖 Սթորի' + (s.x ? '՝ ' + clip(s.x, 40) : ''), m: false } };
+    chatOf(to).push(m);
+    saveMsgs();
+    inp.value = ''; inp.blur();
+    toast('Պատասխանը ուղարկվեց');
+    flush(to);
+  });
+
+  /* the composer */
+  var scMode = 'txt', scBg = 0, scImg = null, scUrl = '';
+  function scPaint() {
+    var prev = $('#sc-prev');
+    prev.style.background = scMode === 'txt' ? STORY_BG[scBg] : '#000';
+    $('#sc-text').hidden = scMode !== 'txt';
+    $('#sc-img').hidden = scMode !== 'img';
+    $('#sc-cap').hidden = scMode !== 'img';
+    $('#sc-bgs').hidden = scMode !== 'txt';
+    $('#sc-txt').classList.toggle('on', scMode === 'txt');
+    $('#sc-photo').classList.toggle('on', scMode === 'img');
+    var chips = $('#sc-bgs').children;
+    for (var k = 0; k < chips.length; k++) chips[k].classList.toggle('on', k === scBg);
+  }
+  (function () {
+    var box = $('#sc-bgs');
+    STORY_BG.forEach(function (g, k) {
+      var b = el('button', 'sc-chip');
+      b.type = 'button';
+      b.style.background = g;
+      b.setAttribute('aria-label', 'Ֆոն ' + (k + 1));
+      b.addEventListener('click', function () { scBg = k; scPaint(); });
+      box.appendChild(b);
+    });
+  })();
+  function openStoryComposer() {
+    scMode = 'txt'; scBg = Math.floor(Math.random() * STORY_BG.length); scImg = null;
+    if (scUrl) { URL.revokeObjectURL(scUrl); scUrl = ''; }
+    $('#sc-text').value = ''; $('#sc-cap').value = ''; $('#sc-img').removeAttribute('src');
+    scPaint();
+    openDialog('#dlg-story');
+  }
+  $('#sc-txt').addEventListener('click', function () { scMode = 'txt'; scPaint(); $('#sc-text').focus(); });
+  $('#sc-photo').addEventListener('click', function () { $('#sc-file').click(); });
+  $('#sc-file').addEventListener('change', function () {
+    var f = this.files && this.files[0];
+    this.value = '';
+    if (!f) return;
+    compressImage(f, function (r) {
+      if (!r) { toast('Այս նկարը չհաջողվեց բացել'); return; }
+      scImg = r; scMode = 'img';
+      if (scUrl) URL.revokeObjectURL(scUrl);
+      scUrl = URL.createObjectURL(r.blob);
+      $('#sc-img').src = scUrl;
+      scPaint();
+    });
+  });
+  $('#sc-cancel').addEventListener('click', function () { closeDialog('#dlg-story'); });
+  $('#sc-post').addEventListener('click', function () {
+    var now = Date.now();
+    var s = { i: uid(), from: 'me', k: scMode, x: '', bg: scBg, ts: now, exp: now + STORY_TTL, sentTo: [], views: [] };
+    if (scMode === 'txt') {
+      s.x = $('#sc-text').value.trim().slice(0, 280);
+      if (!s.x) { toast('Գրիր տեքստ կամ ընտրիր նկար'); return; }
+    } else {
+      if (!scImg) { toast('Ընտրիր նկար'); return; }
+      s.x = $('#sc-cap').value.trim().slice(0, 120);
+    }
+    function done() {
+      stories.push(s); saveStories();
+      closeDialog('#dlg-story');
+      renderStories();
+      broadcastStories();
+      toast('Սթորին հրապարակվեց');
+    }
+    if (s.k === 'img') idbPut('s:' + s.i, scImg.blob, done); else done();
+  });
+
 
   /* ---------- Android back button ---------- */
   window.__back = function () {
@@ -1488,6 +1843,7 @@
     if (incoming) return true;
     var open = document.querySelector('dialog[open]');
     if (open) { try { open.close(); } catch (e) { open.removeAttribute('open'); } return true; }
+    if (storyOpen) { closeStory(); return true; }
     if (rec) { cancelRec(); return true; }
     if (!$('#emoji').hidden) { setEmoji(false); return true; }
     if (!$('#searchbar').hidden) { closeSearch(); return true; }
